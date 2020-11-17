@@ -11,18 +11,17 @@ import com.redhat.cloud.notifications.ingress.Context;
 import com.redhat.cloud.notifications.models.Application;
 import com.redhat.cloud.notifications.models.Endpoint;
 import com.redhat.cloud.notifications.models.EventType;
-import com.redhat.cloud.notifications.models.NotificationHistory;
 import com.redhat.cloud.notifications.models.WebhookAttributes;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.quarkus.test.common.QuarkusTestResource;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.http.ContentType;
 import io.restassured.http.Header;
 import io.restassured.response.Response;
 import io.vertx.core.json.Json;
-import io.vertx.core.json.JsonObject;
 import org.eclipse.microprofile.reactive.messaging.Channel;
 import org.eclipse.microprofile.reactive.messaging.Emitter;
 import org.junit.jupiter.api.BeforeAll;
@@ -34,19 +33,26 @@ import org.junit.jupiter.api.TestMethodOrder;
 import org.mockserver.model.HttpRequest;
 
 import javax.inject.Inject;
+import java.net.Socket;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static com.redhat.cloud.notifications.TestHelpers.serializeAction;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -79,6 +85,9 @@ public class LifecycleITest {
 
     @Inject
     MeterRegistry meterRegistry;
+
+    @TestHTTPResource
+    URI uri;
 
     @BeforeAll
     void setup() {
@@ -256,60 +265,66 @@ public class LifecycleITest {
     }
 
     @Test
-    void t03_fetchHistory() {
-        Response response = given()
-                .header(identityHeader)
-                .when()
-                .contentType(ContentType.JSON)
-                .get("/endpoints")
-                .then()
-                .statusCode(200)
-                .extract().response();
-
-        Endpoint[] endpoints = Json.decodeValue(response.getBody().asString(), Endpoint[].class);
-        assertEquals(2, endpoints.length);
-
-        for (Endpoint ep : endpoints) {
-            // Fetch the notification history for the endpoints
-            response = given()
-                    .header(identityHeader)
-                    .when()
-                    .contentType(ContentType.JSON)
-                    .get(String.format("/endpoints/%s/history", ep.getId().toString()))
-                    .then()
-                    .statusCode(200)
-                    .extract().response();
-
-            NotificationHistory[] histories = Json.decodeValue(response.getBody().asString(), NotificationHistory[].class);
-            assertEquals(1, histories.length);
-
-            for (NotificationHistory history : histories) {
-                // Sort first?
-                if (ep.getName().startsWith("negative")) {
-                    // TODO Validate that we actually reach this part
-                    assertFalse(history.isInvocationResult());
-                    WebhookAttributes attr = (WebhookAttributes) ep.getProperties();
-
-                    // Fetch details
-                    response = given()
+    void t03_fetchHistory() throws Exception {
+        ExecutorService brokenRequestPool = Executors.newFixedThreadPool(20);
+        for (int i = 0; i < 20; ++i) {
+            brokenRequestPool.submit(new Runnable() {
+                @Override
+                public void run() {
+                    for (; ; ) {
+                        RestAssured.get("/non-existant")
+                                .then().statusCode(404);
+//                        try (Socket s = new Socket(uri.getHost(), uri.getPort())) {
+//                            s.getOutputStream().write("GET /non-existant HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".getBytes(StandardCharsets.UTF_8));
+//                            s.getOutputStream().flush();
+//                            while (s.getInputStream().read() > 0) {
+//
+//                            }
+//                        } catch (Exception e) {
+//                            //e.printStackTrace();
+//                        }
+                    }
+                }
+            });
+        }
+        ExecutorService service = Executors.newFixedThreadPool(20);
+        List<Future<?>> rets = new ArrayList<>();
+        for (int i = 0; i < 10000; ++i) {
+            Future<Object> f = service.submit(new Callable<Object>() {
+                @Override
+                public Object call() throws Exception {
+                    Response response = given()
                             .header(identityHeader)
                             .when()
                             .contentType(ContentType.JSON)
-                            .get(String.format("/endpoints/%s/history/%s/details", ep.getId().toString(), history.getId()))
+                            .get("/endpoints")
                             .then()
                             .statusCode(200)
                             .extract().response();
 
-                    JsonObject json = new JsonObject(response.getBody().asString());
-                    assertFalse(json.isEmpty());
-                    assertEquals(400, json.getInteger("code").intValue());
-                    assertEquals(attr.getUrl(), json.getString("url"));
-                    assertEquals(attr.getMethod().toString(), json.getString("method"));
-                } else {
-                    // TODO Validate that we actually reach this part
-                    assertTrue(history.isInvocationResult());
+                    String str = response.getBody().asString();
+                    try {
+                        Endpoint[] endpoints = Json.decodeValue(str, Endpoint[].class);
+                        assertEquals(2, endpoints.length);
+                        return null;
+                    } catch (Exception e) {
+                        throw new RuntimeException("BODY:" + str);
+                    }
                 }
+            });
+            rets.add(f);
+        }
+        Exception ex = null;
+        for (Future<?> f : rets) {
+            try {
+                f.get();
+            } catch (Exception e) {
+                System.out.println(e.getMessage());
+                ex = e;
             }
+        }
+        if (ex != null) {
+            throw ex;
         }
     }
 
